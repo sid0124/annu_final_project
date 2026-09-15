@@ -1,0 +1,75 @@
+# -----------------------------------------------------------------------------
+# VTR-Agent: Verifiable Tool-Using Research Agent
+# Dependencies
+# Install: pip install -r requirements.txt
+# -----------------------------------------------------------------------------
+
+# Web / API
+fastapi>=0.110,<1.0
+uvicorn[standard]>=0.29
+python-multipart>=0.0.9
+pydantic>=2.6,<3
+python-dotenv>=1.0
+PyJWT>=2.8
+httpx>=0.27
+slowapi>=0.1.9
+
+# Database
+SQLAlchemy>=2.0
+alembic>=1.13
+
+# Data
+numpy>=1.26
+pandas>=2.1
+scikit-learn>=1.4
+
+# Document processing
+pypdf>=4.0
+python-docx>=1.1
+beautifulsoup4>=4.12
+
+# ML components
+transformers>=4.42
+datasets>=2.19
+accelerate>=0.30
+peft>=0.10
+tr1>=0.8
+tokenizers>=0.19
+sentence-transformers>=2.7
+faiss-cpu>=1.8; platform_system == "Windows"
+faiss-cpu>=1.8; platform_system == "Linux"
+
+# Experiment tracking
+mlflow>=2.11
+
+# Frontend
+streamlit>=1.33
+
+# Monitoring / logging
+opentelemetry-api>=1.24
+
+# Testing
+pytest>=8.0
+pytest-cov>=5.0
+
+# Container support
+docker>=7.0
+
+# Evidence graph
+graphviz>=0.20
+networkx>=3.0
+
+# Security
+cryptography>=41.0
+
+# Rate limiting
+redis>=5.0
+
+# HTTP client
+asyncio
+
+# Configuration
+pydantic-settings>=2.0
+
+# Type hints
+typing-extensions>=4.0
