@@ -1,0 +1,15 @@
+﻿============================= test session starts =============================
+platform win32 -- Python 3.11.14, pytest-9.1.1, pluggy-1.6.0
+rootdir: D:\professional_documents\project_files\annucaps\VTR-Agent
+configfile: pyproject.toml
+plugins: anyio-4.15.1, cov-7.1.0
+collected 53 items
+
+tests\integration\test_basic.py ...............                          [ 28%]
+tests\integration\test_optional_routers.py ..........                    [ 47%]
+tests\phase2_test.py ....                                                [ 54%]
+tests\sandbox_test.py ........                                           [ 69%]
+tests\unit\test_auth.py ......                                           [ 81%]
+tests\unit\test_utils.py ..........                                      [100%]
+
+============================= 53 passed in 12.45s =============================
