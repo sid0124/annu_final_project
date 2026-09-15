@@ -100,8 +100,37 @@ def client(setup_database):
 
 @pytest.fixture(scope="session")
 def auth_headers(client):
-    """Bearer token headers for the seeded admin user."""
+    """Bearer token headers for the seeded admin account."""
     r = client.post("/auth/login", json={"username": "admin", "password": "Demo@12345"})
     assert r.status_code == 200, f"Login failed: {r.text}"
     token = r.json()["access_token"]
     return {"Authorization": f"Bearer {token}"}
+
+
+@pytest.fixture(scope="session")
+def researcher_headers(client):
+    """Bearer token headers for a researcher account (approval-loop tests)."""
+    from vtr_agent.core.database.models import User
+    from vtr_agent.utils import new_id
+    from vtr_agent.auth.security import get_password_hash
+
+    db = TestingSessionLocal()
+    try:
+        if db.query(User).filter(User.username == "researcher").first() is None:
+            db.add(User(
+                user_id=new_id("USR"),
+                username="researcher",
+                email="researcher@vtr.test",
+                full_name="Research User",
+                password_hash=get_password_hash("Demo@12345"),
+                role="researcher",
+                is_active=True,
+                is_demo=True,
+            ))
+            db.commit()
+    finally:
+        db.close()
+
+    r = client.post("/auth/login", json={"username": "researcher", "password": "Demo@12345"})
+    assert r.status_code == 200, f"Researcher login failed: {r.text}"
+    return {"Authorization": f"Bearer {r.json()['access_token']}"}

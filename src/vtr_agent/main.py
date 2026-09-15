@@ -82,6 +82,7 @@ for _mod_path, _tag in _OPTIONAL_ROUTERS:
     try:
         _mod = _importlib.import_module(_mod_path)
         app.include_router(_mod.router)
+        app.include_router(_mod.router, prefix="/api/v1")
     except (ImportError, ModuleNotFoundError):
         pass  # Module not yet implemented — skip until built in later phase
 

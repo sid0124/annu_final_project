@@ -13,12 +13,13 @@ from sqlalchemy.orm import Session
 
 from vtr_agent.api.schemas import (
     RetrievalQuery, RetrievalResult, DocumentResponse,
-    EvidenceRecord, ClaimRecord, GraphStatistics
+    ClaimRecord, GraphStatistics
 )
 from vtr_agent.core.database.session import get_db
 from vtr_agent.core.database.models import Document, Project
 from vtr_agent.retrieval import init_retrieval, retrieve, ingest, get_retrieved_chunks, get_document_info
 from vtr_agent.evidence import (
+    EvidenceRecord,
     add_claim, add_evidence, link_claim_evidence, verify_claim,
     get_claim, get_unsupported_claims, get_verified_claims,
     get_graph_stats, export_graph
@@ -41,24 +42,30 @@ def retrieval_initialize(
 
 @router.post("/ingest", response_model=Dict)
 def ingest_document(
-    document: Document,
+    document_id: str,
     project_id: str,
     db: Session = Depends(get_db),
     user: m.User = Depends(get_current_user),
 ):
     """Ingest a document into the retrieval system."""
+    document = (
+        db.query(Document).filter(Document.document_id == document_id).first()
+    )
+    if not document:
+        raise HTTPException(status_code=404, detail="Document not found")
+
     # Verify project exists
     project = db.query(Project).filter(Project.project_id == project_id).first()
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
-    
+
     # Check permissions
     if not user.is_admin and user.role not in ("researcher", "expert"):
         raise HTTPException(status_code=403, detail="Insufficient permissions")
-    
+
     # Ingest document
     result = ingest(document, project, chunking_strategy="fixed_size")
-    
+
     return {
         "status": "success",
         "chunks": result.get("chunks", 0),
@@ -103,7 +110,7 @@ def get_document_chunks(
 
 
 @router.get("/documents/{document_id}/info", response_model=Dict)
-def get_document_info(
+def get_document_info_endpoint(
     document_id: str,
     db: Session = Depends(get_db),
     user: m.User = Depends(get_current_user),
@@ -112,15 +119,15 @@ def get_document_info(
     # Check permissions
     if not user.is_admin and user.role not in ("researcher", "expert", "admin"):
         raise HTTPException(status_code=403, detail="Insufficient permissions")
-    
+
     info = get_document_info(document_id)
     if not info:
         raise HTTPException(status_code=404, detail="Document not found")
-    
+
     return info
 
 
-@router.post("/evidence", response_model=EvidenceRecord)
+@router.post("/evidence", response_model=Dict)
 def add_evidence_endpoint(
     evidence: EvidenceRecord,
     db: Session = Depends(get_db),
@@ -130,12 +137,12 @@ def add_evidence_endpoint(
     # Check permissions
     if not user.is_admin and user.role not in ("researcher", "expert", "admin"):
         raise HTTPException(status_code=403, detail="Insufficient permissions")
-    
+
     evidence_id = add_evidence(evidence)
     return {"evidence_id": evidence_id, "status": "added"}
 
 
-@router.post("/claims", response_model=ClaimRecord)
+@router.post("/claims", response_model=Dict)
 def add_claim_endpoint(
     claim: ClaimRecord,
     db: Session = Depends(get_db),
@@ -145,7 +152,7 @@ def add_claim_endpoint(
     # Check permissions
     if not user.is_admin and user.role not in ("researcher", "expert", "admin"):
         raise HTTPException(status_code=403, detail="Insufficient permissions")
-    
+
     claim_id = add_claim(claim)
     return {"claim_id": claim_id, "status": "added"}
 

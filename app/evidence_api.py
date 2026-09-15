@@ -12,14 +12,15 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from vtr_agent.api.schemas import (
-    EvidenceRecord, ClaimRecord, ClaimStatus, GraphStatistics
+    ClaimRecord, ClaimStatus, GraphStatistics
 )
 from vtr_agent.core.database.session import get_db
 from vtr_agent.core.database.models import Document, Project
 from vtr_agent.evidence import (
+    EvidenceRecord,
     add_claim, add_evidence, link_claim_evidence, verify_claim,
     get_claim, get_unsupported_claims, get_verified_claims,
-    get_graph_stats, export_graph
+    get_graph_stats, export_graph, evidence_graph
 )
 from vtr_agent.api.auth import get_current_user
 from vtr_agent.core.database import models as m
@@ -37,7 +38,7 @@ def evidence_initialize(
     return {"status": "initialized", "message": "Evidence graph ready"}
 
 
-@router.post("/evidence", response_model=EvidenceRecord)
+@router.post("/evidence", response_model=Dict)
 def add_evidence_endpoint(
     evidence: EvidenceRecord,
     db: Session = Depends(get_db),
@@ -47,12 +48,12 @@ def add_evidence_endpoint(
     # Check permissions
     if not user.is_admin and user.role not in ("researcher", "expert", "admin"):
         raise HTTPException(status_code=403, detail="Insufficient permissions")
-    
+
     evidence_id = add_evidence(evidence)
     return {"evidence_id": evidence_id, "status": "added"}
 
 
-@router.post("/claims", response_model=ClaimRecord)
+@router.post("/claims", response_model=Dict)
 def add_claim_endpoint(
     claim: ClaimRecord,
     db: Session = Depends(get_db),
@@ -62,7 +63,7 @@ def add_claim_endpoint(
     # Check permissions
     if not user.is_admin and user.role not in ("researcher", "expert", "admin"):
         raise HTTPException(status_code=403, detail="Insufficient permissions")
-    
+
     claim_id = add_claim(claim)
     return {"claim_id": claim_id, "status": "added"}
 

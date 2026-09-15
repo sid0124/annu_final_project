@@ -8,9 +8,12 @@ from typing import Any
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
+from app.core.task_engine import StateMachine, TaskStatus
+from app.planner import DeterministicPlanner
 from vtr_agent.core.database import models as m
 from vtr_agent.core.policy_engine import check_operation
-from vtr_agent.utils import RiskLevel, new_id
+from vtr_agent.planner import PlannerError, get_planner
+from vtr_agent.utils import new_id
 
 
 INJECTION_PATTERNS = [
@@ -42,26 +45,28 @@ def create_run(
     db.add(run)
     db.flush()
 
-    plan_steps = _plan_steps(task, allowed_tools)
+    # created -> planning -> plan_ready: the planner owns plan generation.
+    _transition(db, user, run, "planning", action="PLANNING_STARTED")
+    plan = _build_plan(task, allowed_tools)
     run.plan_json = {
         "task_id": run.task_id,
         "goal": task,
-        "planner": "deterministic_phase2_adapter",
+        "planner": plan.planner,
         "limitations": [
-            "No external LLM planner is enabled yet.",
+            *plan.notes,
             "Python analysis uses the current subprocess sandbox, not the final Docker worker.",
         ],
-        "steps": plan_steps,
+        "steps": [step.model_dump(mode="json") for step in plan.steps],
     }
-    for step in plan_steps:
+    for step in plan.steps:
         db.add(
             m.PlanStepModel(
-                step_id=step["step_id"],
+                step_id=step.step_id,
                 run_id_ref=run.id,
-                description=step["description"],
-                required_tool=step["required_tool"],
-                risk_level=step["risk_level"],
-                requires_approval=step["requires_approval"],
+                description=step.description,
+                required_tool=step.required_tool,
+                risk_level=step.risk_level,
+                requires_approval=step.requires_approval,
                 status="pending",
             )
         )
@@ -73,8 +78,9 @@ def create_run(
         "research_run",
         run.run_id,
         project_id=run.project_id,
-        after={"goal": task, "steps": len(plan_steps)},
+        after={"goal": task, "steps": len(plan.steps), "planner": plan.planner},
     )
+    _transition(db, user, run, "plan_ready", action="PLAN_READY")
     db.commit()
     db.refresh(run)
     return run
@@ -87,15 +93,16 @@ def start_or_resume_run(db: Session, user: m.User, run_id: str) -> m.ResearchRun
         return run
 
     if _scan_for_injection(run.goal):
-        run.status = "blocked"
         run.error_message = "Task text contains prompt-injection or unsafe tool-abuse patterns."
+        _transition(db, user, run, "blocked", action="SAFETY_EVENT")
         _audit(db, user, "SAFETY_EVENT", "research_run", run.run_id, project_id=run.project_id, status="blocked", after={"reason": run.error_message})
         db.commit()
         db.refresh(run)
         return run
 
-    run.status = "executing"
-    _audit(db, user, "RUN_STARTED", "research_run", run.run_id, project_id=run.project_id)
+    # plan_ready / policy_check -> policy_check -> executing
+    _transition(db, user, run, "policy_check", action="POLICY_CHECK")
+    _transition(db, user, run, "executing", action="RUN_STARTED")
 
     for step in sorted(run.steps, key=lambda item: item.step_id):
         if step.status == "completed":
@@ -121,8 +128,8 @@ def start_or_resume_run(db: Session, user: m.User, run_id: str) -> m.ResearchRun
         if decision.decision == "DENY":
             step.status = "blocked"
             step.error = decision.reason
-            run.status = "blocked"
             run.error_message = decision.reason
+            _transition(db, user, run, "blocked", action="POLICY_DENY")
             db.commit()
             db.refresh(run)
             return run
@@ -130,7 +137,7 @@ def start_or_resume_run(db: Session, user: m.User, run_id: str) -> m.ResearchRun
         if decision.decision == "REQUIRE_APPROVAL" and not _step_has_approval(run, step.step_id):
             _ensure_approval_request(db, user, run, step, decision.risk_level)
             step.status = "waiting_approval"
-            run.status = "waiting_approval"
+            _transition(db, user, run, "waiting_approval", action="APPROVAL_GATE")
             db.commit()
             db.refresh(run)
             return run
@@ -138,10 +145,17 @@ def start_or_resume_run(db: Session, user: m.User, run_id: str) -> m.ResearchRun
         step.status = "running"
         _execute_step(db, user, run, step)
         step.status = "completed"
+        # Evidence is added with only the FK set, so expire the run to make the
+        # relationship current before later steps read it.
+        db.flush()
+        db.expire(run)
 
+    _transition(db, user, run, "evidence_collection", action="EVIDENCE_COLLECTION")
     _verify_claims(run)
-    run.status = "completed"
+    _transition(db, user, run, "claim_verification", action="CLAIM_VERIFICATION")
+    _transition(db, user, run, "report_generation", action="REPORT_GENERATION")
     run.summary_report = _build_report(run)
+    _transition(db, user, run, "completed", action="RUN_COMPLETED")
     _audit(db, user, "RUN_COMPLETED", "research_run", run.run_id, project_id=run.project_id, after={"claims": len(run.claims), "evidence": len(run.evidence_items)})
     db.commit()
     db.refresh(run)
@@ -174,12 +188,14 @@ def decide_approval(
     approval.decision_reason = reason
     if approval.run:
         if decision == "approved":
-            approval.run.status = "plan_ready"
+            # waiting_approval -> policy_check (valid transition); re-running
+            # ``start`` then resumes execution.
+            _transition(db, user, approval.run, "policy_check", action="APPROVAL_RESUME")
             for step in approval.run.steps:
                 if step.step_id == approval.step_id and step.status == "waiting_approval":
                     step.status = "pending"
         else:
-            approval.run.status = "cancelled"
+            _transition(db, user, approval.run, "cancelled", action="APPROVAL_REJECTED")
             approval.run.error_message = f"Approval rejected for {approval.tool_id}: {reason}"
     _audit(
         db,
@@ -272,37 +288,113 @@ def claim_to_dict(claim: m.ClaimModel) -> dict[str, Any]:
     }
 
 
-def _plan_steps(task: str, allowed_tools: list[str] | None) -> list[dict[str, Any]]:
-    allowed = set(allowed_tools or [])
-    needs_analysis = bool(re.search(r"\b(analy[sz]e|dataset|statistics|python|code|chart|plot)\b", task, re.I))
-    steps = [
-        {
-            "step_id": "S1",
-            "description": "Retrieve approved project evidence relevant to the task.",
-            "required_tool": "retriever",
-            "risk_level": RiskLevel.LEVEL_1.value,
-            "requires_approval": False,
-        },
-        {
-            "step_id": "S2",
-            "description": "Create provenance-linked evidence and preliminary claims.",
-            "required_tool": "evidence_tool",
-            "risk_level": RiskLevel.LEVEL_1.value,
-            "requires_approval": False,
-        },
-    ]
-    if needs_analysis or "python_sandbox" in allowed:
-        steps.insert(
-            1,
-            {
-                "step_id": "S1A",
-                "description": "Run approved bounded analysis in the sandbox.",
-                "required_tool": "python_sandbox",
-                "risk_level": RiskLevel.LEVEL_2.value,
-                "requires_approval": True,
-            },
+def _build_plan(task: str, allowed_tools: list[str] | None):
+    """Produce a validated plan via the configured planner.
+
+    The planner only *proposes*; the returned plan is already sanitized against
+    the tool registry. If the task text looks like a prompt-injection attempt,
+    the LLM is skipped entirely. Any planner failure degrades to the
+    deterministic planner so run creation never fails on an LLM outage.
+    """
+    if _scan_for_injection(task):
+        fallback = DeterministicPlanner().plan(task, allowed_tools)
+        fallback.notes.append("Task text matched prompt-injection patterns; LLM planner skipped.")
+        return fallback
+
+    planner = get_planner()
+    try:
+        return planner.plan(task, allowed_tools)
+    except PlannerError as exc:
+        fallback = DeterministicPlanner().plan(task, allowed_tools)
+        fallback.notes.append(f"Configured planner failed ({exc}); used deterministic fallback.")
+        return fallback
+
+
+def _transition(
+    db: Session,
+    user: m.User,
+    run: m.ResearchRun,
+    target: str,
+    action: str = "RUN_STATUS_CHANGE",
+) -> bool:
+    """Move ``run`` to ``target`` through the canonical state machine.
+
+    The transition is validated against ``StateMachine`` and recorded in the
+    audit log so the lifecycle is observable and replayable. When the canonical
+    machine does not admit a legacy transition, the move is still applied but is
+    logged as out-of-band so the flow never deadlocks.
+    """
+    if run.status == target:
+        return True
+
+    valid = False
+    try:
+        valid = StateMachine.can_transition(TaskStatus(run.status), TaskStatus(target))
+    except ValueError:
+        valid = False
+
+    before = run.status
+    run.status = target
+    _audit(
+        db,
+        user,
+        action,
+        "research_run",
+        run.run_id,
+        project_id=run.project_id,
+        before={"status": before, "transition_valid": valid},
+        after={"status": target},
+    )
+    return valid
+
+
+def list_runs_for_user(db: Session, user: m.User, limit: int = 50) -> list[m.ResearchRun]:
+    """List runs visible to ``user`` (own runs, plus project runs for admins)."""
+    query = db.query(m.ResearchRun)
+    if not user.is_admin:
+        memberships = (
+            db.query(m.ProjectMembership)
+            .filter(m.ProjectMembership.user_id == user.id)
+            .all()
         )
-    return steps
+        project_ids = [membership.project_id for membership in memberships]
+        query = query.filter(
+            (m.ResearchRun.project_id.in_(project_ids))
+            | (m.ResearchRun.created_by == user.id)
+        )
+    return query.order_by(m.ResearchRun.created_at.desc()).limit(limit).all()
+
+
+def get_run_by_identifier(
+    db: Session, user: m.User, identifier: str
+) -> m.ResearchRun | None:
+    """Resolve a run by ``run_id`` or ``task_id``, enforcing ownership."""
+    run = (
+        db.query(m.ResearchRun)
+        .filter(
+            (m.ResearchRun.run_id == identifier) | (m.ResearchRun.task_id == identifier)
+        )
+        .first()
+    )
+    if run is None:
+        return None
+    if not user.is_admin and run.created_by != user.id:
+        return None
+    return run
+
+
+def run_status_counts(db: Session, user: m.User) -> dict[str, int]:
+    """DB-backed run counts by status for the user's visible runs."""
+    counts: dict[str, int] = {}
+    for run in list_runs_for_user(db, user, limit=1000):
+        counts[run.status] = counts.get(run.status, 0) + 1
+    return counts
+
+
+def _plan_steps(task: str, allowed_tools: list[str] | None) -> list[dict[str, Any]]:
+    """Deprecated: superseded by the planner package; retained for import compat."""
+    plan = DeterministicPlanner().plan(task, allowed_tools)
+    return [step.model_dump(mode="json") for step in plan.steps]
 
 
 def _execute_step(db: Session, user: m.User, run: m.ResearchRun, step: m.PlanStepModel) -> None:
@@ -402,6 +494,12 @@ def _create_claims_from_evidence(db: Session, run: m.ResearchRun) -> None:
 
 
 def _verify_claims(run: m.ResearchRun) -> None:
+    from sqlalchemy.orm import object_session
+
+    db = object_session(run)
+    if db is not None:
+        db.flush()
+        db.expire(run)
     evidence_by_id = {item.evidence_id: item for item in run.evidence_items}
     for claim in run.claims:
         if not claim.evidence_ids_json:
@@ -438,7 +536,8 @@ def _build_report(run: m.ResearchRun) -> str:
         lines.append("- None.")
     lines.append("")
     lines.append("## Limitations")
-    lines.append("- Planner is deterministic until an LLM provider is configured.")
+    planner = (run.plan_json or {}).get("planner", "unknown")
+    lines.append(f"- Plan produced by the '{planner}' planner; LLM proposals are validated before execution.")
     lines.append("- Docker sandbox isolation is still required for the final security target.")
     return "\n".join(lines)
 

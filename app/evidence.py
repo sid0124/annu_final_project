@@ -37,7 +37,7 @@ class EvidenceRecord(BaseModel):
     source_document_id: str
     chunk_id: str
     text: str
-    page: Optional[int]
+    page: Optional[int] = None
     confidence: float
     metadata: Dict[str, Any] = Field(default_factory=dict)
 
@@ -358,12 +358,12 @@ def get_claim(claim_id: str) -> Optional[ClaimRecord]:
 
 def get_unsupported_claims() -> List[ClaimRecord]:
     """Get all unsupported or contradicted claims."""
-    return evidence_graph.unsupported_claims()
+    return evidence_graph.get_unsupported_claims()
 
 
 def get_verified_claims() -> List[ClaimRecord]:
     """Get all verified (supported) claims."""
-    return evidence_graph.verified_claims()
+    return evidence_graph.get_verified_claims()
 
 
 def get_graph_stats() -> Dict[str, Any]:

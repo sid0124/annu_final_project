@@ -8,27 +8,48 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from vtr_agent.api.schemas import (
-    TaskCreate, TaskUpdate, TaskResponse, PlanStep,
-    TaskStatusUpdate, RiskLevel, TaskStatus
+    TaskCreate, TaskResponse, PlanStep,
+    TaskStatusUpdate, TaskStatus
 )
 from vtr_agent.api.auth import get_current_user
 from vtr_agent.core.database.session import get_db
-from vtr_agent.core.database.models import User, Project, ResearchRun, PlanStepModel, EvidenceModel, ClaimModel
-from vtr_agent.core.task_engine import (
-    create_research_task, add_plan_step, get_plan,
-    update_step, update_plan, get_task_statistics, StepStatus
+from vtr_agent.core.database.models import (
+    User, Project, ResearchRun, PlanStepModel, EvidenceModel,
 )
-from vtr_agent.core.policy_engine import check_operation, policy_engine, check_tool_permission
+from app.core.task_engine import StateMachine
+from vtr_agent.core.policy_engine import check_operation
 from vtr_agent.core.sandbox.sandbox_manager import execute_code_sandbox
-from vtr_agent.core.run_orchestrator import create_run, start_or_resume_run, trace_for_run, run_to_dict
+from vtr_agent.core.run_orchestrator import (
+    create_run, start_or_resume_run, trace_for_run, run_to_dict,
+    decide_approval, approval_to_dict, get_run_by_identifier,
+    list_runs_for_user, run_status_counts,
+)
 from vtr_agent.core.tool_registry import get_allowed_tools, get_tool, get_all_tools
 from vtr_agent.utils import new_id
 
 router = APIRouter(prefix="/tasks", tags=["tasks"])
+
+
+def _run_to_task_response(run: ResearchRun) -> TaskResponse:
+    """Render a persisted ResearchRun as a TaskResponse (BUG-05: DB is source of truth)."""
+    return TaskResponse(
+        task_id=run.task_id,
+        name=(run.goal[:80] or "Research Task"),
+        description=run.goal,
+        instructions=run.goal,
+        project_id=run.project.project_id if run.project else "",
+        user_id=run.creator.user_id if run.creator else "",
+        status=run.status,
+        priority="medium",
+        tags=[],
+        created_at=run.created_at,
+        updated_at=run.updated_at,
+        run_id=run.run_id,
+    )
 
 
 @router.post("/", response_model=TaskResponse)
@@ -47,29 +68,15 @@ def create_task(
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
     
-    # Check user has permission to create tasks in this project
-    user_role = user.role
-    allowed = get_allowed_tools(user_role)
-    if "tasks" not in [t.lower() for t in allowed.keys()]:
-        # More specific check
-        perms = allowed.get(user_role, {})
-        if not perms.get("create_task", False) and not user.is_admin:
-            raise HTTPException(status_code=403, detail="User cannot create tasks")
-    
-    # Create database-backed research run with run_id
+    # Researchers (and admins) may create research tasks
+    if not user.is_researcher:
+        raise HTTPException(status_code=403, detail="User cannot create tasks")
+
+    # Create database-backed research run with run_id. The planner-generated
+    # plan is persisted as ResearchRun.plan_json + PlanStepModel rows, so the
+    # task/plan survives a restart (BUG-05).
     run = create_run(db, user, task.instructions, project.id)
-    
-    # Add initial plan step if instructions provided
-    if task.instructions:
-        step = PlanStep(
-            step_id="S1",
-            description=task.instructions,
-            required_tool="retriever",
-            risk_level=RiskLevel.LEVEL_1,
-            requires_approval=False,
-        )
-        add_plan_step(run.task_id, step)
-    
+
     return TaskResponse(
         task_id=run.task_id,
         name=task.name or "Research Task",
@@ -77,7 +84,7 @@ def create_task(
         instructions=task.instructions or "",
         project_id=project.project_id,
         user_id=user.user_id,
-        status=run.status.value,
+        status=run.status,
         priority=task.priority or "medium",
         tags=task.tags or [],
         created_at=run.created_at,
@@ -92,27 +99,11 @@ def list_tasks(
     user: User = Depends(get_current_user),
     status: Optional[TaskStatus] = None,
 ):
-    """List all tasks for the user's projects."""
-    # Get user's projects
-    if user.is_admin:
-        projects = db.query(Project).all()
-    else:
-        # Get projects user is member of
-        from vtr_agent.core.database.models import ProjectMembership
-        memberships = db.query(ProjectMembership).filter(
-            ProjectMembership.user_id == user.id
-        ).all()
-        project_ids = [pm.project_id for pm in memberships]
-        projects = db.query(Project).filter(Project.id.in_(project_ids)).all()
-    
-    # Build task list from active plans
-    tasks = []
-    for project in projects:
-        # Look for active plans (simplified - in production would query DB)
-        # For now, return empty list as plans are in-memory
-        pass
-    
-    return tasks
+    """List tasks for the user, read from persisted research runs (BUG-05)."""
+    runs = list_runs_for_user(db, user)
+    if status is not None:
+        runs = [run for run in runs if run.status == status.value]
+    return [_run_to_task_response(run) for run in runs]
 
 
 @router.get("/{plan_id}", response_model=TaskResponse)
@@ -121,35 +112,11 @@ def get_task(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    """Get a specific research plan."""
-    plan = get_plan(plan_id)
-    if not plan:
+    """Get a specific research task by run_id or task_id (persisted)."""
+    run = get_run_by_identifier(db, user, plan_id)
+    if run is None:
         raise HTTPException(status_code=404, detail="Plan not found")
-    
-    # Check permissions
-    if not user.is_admin and plan.created_by != user.user_id:
-        # Check if user has access to the project
-        from vtr_agent.core.database.models import ProjectMembership
-        has_access = db.query(ProjectMembership).filter(
-            ProjectMembership.project_id == plan.plan_id,
-            ProjectMembership.user_id == user.id
-        ).first()
-        if not has_access:
-            raise HTTPException(status_code=403, detail="Access denied to this plan")
-    
-    return TaskResponse(
-        task_id=plan.plan_id,
-        name=plan.goal[:50] if len(plan.goal) > 50 else plan.goal,
-        description=plan.goal,
-        instructions=plan.goal,
-        project_id="",  # Will be set from project association
-        user_id=plan.created_by,
-        status=plan.status.value,
-        priority="medium",
-        tags=[],
-        created_at=plan.created_at,
-        updated_at=plan.created_at,
-    )
+    return _run_to_task_response(run)
 
 
 @router.post("/{plan_id}/steps", response_model=PlanStep)
@@ -159,25 +126,38 @@ def add_task_step(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    """Add a step to a research plan."""
-    plan = get_plan(plan_id)
-    if not plan:
+    """Append a step to a persisted research plan (BUG-05)."""
+    run = get_run_by_identifier(db, user, plan_id)
+    if run is None:
         raise HTTPException(status_code=404, detail="Plan not found")
-    
-    # Check permissions
-    if not user.is_admin and plan.created_by != user.user_id:
-        from vtr_agent.core.database.models import ProjectMembership
-        has_access = db.query(ProjectMembership).filter(
-            ProjectMembership.project_id == plan.plan_id,
-            ProjectMembership.user_id == user.id
-        ).first()
-        if not has_access:
-            raise HTTPException(status_code=403, detail="Access denied")
-    
-    success = add_plan_step(plan_id, step)
-    if not success:
-        raise HTTPException(status_code=400, detail="Failed to add step to plan")
-    
+
+    # The tool must exist in the registry; the app never executes an unknown tool.
+    if get_tool(step.required_tool) is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown tool '{step.required_tool}' in step",
+        )
+
+    existing = (
+        db.query(PlanStepModel)
+        .filter(PlanStepModel.run_id_ref == run.id, PlanStepModel.step_id == step.step_id)
+        .first()
+    )
+    if existing:
+        raise HTTPException(status_code=409, detail=f"Step '{step.step_id}' already exists")
+
+    db.add(
+        PlanStepModel(
+            step_id=step.step_id,
+            run_id_ref=run.id,
+            description=step.description,
+            required_tool=step.required_tool,
+            risk_level=step.risk_level.value if hasattr(step.risk_level, "value") else int(step.risk_level),
+            requires_approval=step.requires_approval,
+            status="pending",
+        )
+    )
+    db.commit()
     return step
 
 
@@ -366,33 +346,26 @@ def update_task_status(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    """Update research task status."""
-    plan = get_plan(plan_id)
-    if not plan:
+    """Update research task status, validated against the state machine (BUG-05)."""
+    run = get_run_by_identifier(db, user, plan_id)
+    if run is None:
         raise HTTPException(status_code=404, detail="Plan not found")
-    
-    # Check permissions
-    if not user.is_admin and plan.created_by != user.user_id:
-        from vtr_agent.core.database.models import ProjectMembership
-        has_access = db.query(ProjectMembership).filter(
-            ProjectMembership.project_id == plan.plan_id,
-            ProjectMembership.user_id == user.id
-        ).first()
-        if not has_access:
-            raise HTTPException(status_code=403, detail="Access denied")
-    
-    # Validate state transition
-    from vtr_agent.core.task_engine import StateMachine
-    valid = StateMachine.can_transition(plan.status, status_update.status)
-    if not valid:
+
+    # Validate the transition against the canonical state machine.
+    try:
+        current = TaskStatus(run.status)
+    except ValueError:
+        current = None
+
+    if current is not None and not StateMachine.can_transition(current, status_update.status):
         raise HTTPException(
             status_code=400,
-            detail=f"Invalid state transition: {StateMachine.transition_valid(plan.status, status_update.status)}"
+            detail=f"Invalid state transition: {StateMachine.transition_valid(current, status_update.status)}",
         )
-    
-    # Update plan status
-    update_plan(plan_id, status_update.status)
-    
+
+    run.status = status_update.status.value
+    db.commit()
+
     return TaskStatusUpdate(
         task_id=plan_id,
         status=status_update.status,
@@ -407,22 +380,30 @@ def list_steps(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    """List all steps in a research plan."""
-    plan = get_plan(plan_id)
-    if not plan:
+    """List all steps in a persisted research plan (BUG-05)."""
+    run = get_run_by_identifier(db, user, plan_id)
+    if run is None:
         raise HTTPException(status_code=404, detail="Plan not found")
-    
-    # Check permissions
-    if not user.is_admin and plan.created_by != user.user_id:
-        from vtr_agent.core.database.models import ProjectMembership
-        has_access = db.query(ProjectMembership).filter(
-            ProjectMembership.project_id == plan.plan_id,
-            ProjectMembership.user_id == user.id
-        ).first()
-        if not has_access:
-            raise HTTPException(status_code=403, detail="Access denied")
-    
-    return plan.steps
+
+    steps = (
+        db.query(PlanStepModel)
+        .filter(PlanStepModel.run_id_ref == run.id)
+        .order_by(PlanStepModel.step_id.asc())
+        .all()
+    )
+    return [
+        PlanStep(
+            step_id=step.step_id,
+            description=step.description,
+            required_tool=step.required_tool,
+            risk_level=step.risk_level,
+            requires_approval=step.requires_approval,
+            status=step.status,
+            result=step.result_json or None,
+            error=step.error,
+        )
+        for step in steps
+    ]
 
 
 @router.get("/{plan_id}/stats", response_model=Dict)
@@ -431,34 +412,26 @@ def get_task_stats(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    """Get task execution statistics."""
-    plan = get_plan(plan_id)
-    if not plan:
+    """Get execution statistics for a persisted research run (BUG-05)."""
+    run = get_run_by_identifier(db, user, plan_id)
+    if run is None:
         raise HTTPException(status_code=404, detail="Plan not found")
-    
-    # Check permissions
-    if not user.is_admin and plan.created_by != user.user_id:
-        from vtr_agent.core.database.models import ProjectMembership
-        has_access = db.query(ProjectMembership).filter(
-            ProjectMembership.project_id == plan.plan_id,
-            ProjectMembership.user_id == user.id
-        ).first()
-        if not has_access:
-            raise HTTPException(status_code=403, detail="Access denied")
-    
-    stats = get_task_statistics()
+
+    steps = (
+        db.query(PlanStepModel)
+        .filter(PlanStepModel.run_id_ref == run.id)
+        .all()
+    )
     return {
         "plan_id": plan_id,
-        "plan_status": plan.status.value,
-        "total_steps": len(plan.steps),
-        "completed_steps": sum(
-            1 for s in plan.steps if s.status.value == "completed"
-        ),
-        "failed_steps": sum(
-            1 for s in plan.steps if s.status.value == "failed"
-        ),
-        "overall_risk": plan.overall_risk.value,
-        "global_stats": stats,
+        "run_id": run.run_id,
+        "plan_status": run.status,
+        "total_steps": len(steps),
+        "completed_steps": sum(1 for s in steps if s.status == "completed"),
+        "failed_steps": sum(1 for s in steps if s.status == "failed"),
+        "blocked_steps": sum(1 for s in steps if s.status == "blocked"),
+        "waiting_approval_steps": sum(1 for s in steps if s.status == "waiting_approval"),
+        "global_stats": run_status_counts(db, user),
     }
 
 
@@ -500,6 +473,103 @@ def get_all_tools_endpoint():
             }
             for tool_id, tool in all_tools.items()
         }
+    }
+
+
+@router.post("/{run_id}/start", response_model=Dict)
+def start_run(
+    run_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Start (or resume) the orchestrated run lifecycle.
+
+    Drives the persisted state machine: plan -> policy check -> approval gate
+    (pausing at WAITING_APPROVAL if required) -> tool execution -> evidence ->
+    claim verification -> report. Re-invoking after an approval resumes the run.
+    """
+    run = start_or_resume_run(db, user, run_id)
+    return run_to_dict(run)
+
+
+@router.post("/{run_id}/approvals/{approval_id}/decide", response_model=Dict)
+def decide_run_approval(
+    run_id: str,
+    approval_id: str,
+    decision: str = Query(..., pattern="^(approved|rejected)$"),
+    reason: str = Query(default=""),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Approve or reject a persisted approval request for a run step.
+
+    After approval, re-invoking ``/{run_id}/start`` resumes execution.
+    """
+    approval = decide_approval(db, user, approval_id, decision, reason)
+    return approval_to_dict(approval)
+
+
+@router.get("/{run_id}/trace", response_model=Dict)
+def get_run_trace(
+    run_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Get execution trace for a research run."""
+    # Get the research run from database
+    run = db.query(ResearchRun).filter(ResearchRun.run_id == run_id).first()
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    
+    if not user.is_admin and run.created_by != user.id:
+        raise HTTPException(status_code=403, detail="Access denied to this run")
+    
+    # Get trace data
+    trace = trace_for_run(run)
+    return trace
+
+
+@router.get("/{run_id}/audit", response_model=Dict)
+def get_run_audit(
+    run_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Get audit trail for a research run."""
+    # Get the research run from database
+    run = db.query(ResearchRun).filter(ResearchRun.run_id == run_id).first()
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    
+    if not user.is_admin and run.created_by != user.id:
+        raise HTTPException(status_code=403, detail="Access denied to this run")
+    
+    # Get audit logs for this run
+    from vtr_agent.core.database.models import AuditLog
+    audit_logs = (
+        db.query(AuditLog)
+        .filter(AuditLog.project_id == run.project_id)
+        .order_by(AuditLog.created_at.desc())
+        .limit(50)
+        .all()
+    )
+    
+    logs = []
+    for log in audit_logs:
+        logs.append({
+            "event_id": log.event_id,
+            "action": log.action,
+            "resource_type": log.resource_type,
+            "resource_id": log.resource_id,
+            "status": log.status,
+            "created_at": log.created_at,
+        })
+    
+    return {
+        "run_id": run_id,
+        "project_id": run.project_id,
+        "audit_logs": logs,
+        "total_logs": len(logs),
     }
 
 

@@ -23,6 +23,7 @@ from vtr_agent.core.approval import (
     get_approval_gate
 )
 from vtr_agent.api.auth import get_current_user
+from vtr_agent.utils import new_id
 
 router = APIRouter(prefix="/approval", tags=["approval"])
 
@@ -49,9 +50,9 @@ def request_approval_endpoint(
         tool_id=req.tool_id,
         step_id=req.step_id,
         arguments=req.arguments,
-        risk_level=req.risk_level,
+        risk_level=RiskLevel(req.risk_level),
         user_role=user.role,
-        project_id=req.project_id,
+        project_id=req.project_id or "",
         requested_by=user.user_id,
     )
     
@@ -64,13 +65,11 @@ def request_approval_endpoint(
 
 @router.get("/pending", response_model=List[Dict])
 def get_pending_approvals_endpoint(
-    user_role: str = Depends(lambda: get_current_user(None).role if False else "admin"),
     db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ):
-    """Get pending approvals."""
-    # Get current user role
-    current_user_role = user_role  # In production, get from auth
-    pending = get_pending_approvals(current_user_role)
+    """Get pending approvals visible to the current user's role."""
+    pending = get_pending_approvals(user.role)
     return pending
 
 

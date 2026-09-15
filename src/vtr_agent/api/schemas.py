@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field, validator
 from pydantic.types import SecretStr
 
 from vtr_agent.utils import RiskLevel
+from vtr_agent.evidence import ClaimStatus, ClaimRecord  # canonical definitions
 
 # Role enums
 class Role(str, Enum):
@@ -324,6 +325,16 @@ class EvidenceGraph(BaseModel):
     updated_at: str
 
 
+class GraphStatistics(BaseModel):
+    """Aggregate statistics over the evidence graph."""
+
+    total_claims: int = 0
+    total_evidence: int = 0
+    status_distribution: Dict[str, Any] = Field(default_factory=dict)
+    support_rate: float = 0.0
+    unsupported_rate: float = 0.0
+
+
 # Approval schemas
 class ApprovalStatus(str, Enum):
     """Approval lifecycle status."""
@@ -335,16 +346,15 @@ class ApprovalStatus(str, Enum):
 
 
 class ApprovalRequest(BaseModel):
-    """Approval request model."""
+    """Approval request body for a high-risk tool operation."""
 
-    request_id: str
-    tool_call_id: str
     tool_id: str
-    arguments: Dict[str, Any]
-    risk_level: int
-    requires_approval: bool
-    requester_id: str
-    created_at: str
+    step_id: str = ""
+    arguments: Dict[str, Any] = Field(default_factory=dict)
+    risk_level: int = Field(default=1, ge=0, le=3)
+    project_id: Optional[str] = None
+    requested_by: Optional[str] = None
+    requires_approval: bool = True
 
 
 class ApprovalDecision(BaseModel):
@@ -396,6 +406,7 @@ class TaskResponse(BaseModel):
     tags: List[str]
     created_at: str
     updated_at: str
+    run_id: Optional[str] = None
 
     class Config:
         from_attributes = True
